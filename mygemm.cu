@@ -74,47 +74,54 @@ __global__ void matmulKernel_blocktile(float *a, float *b, float *c, int M, int 
     c[row*N+col] = val;
 }
 
-// each thread process multiple output cells 
+// matrix A: read a BM * BK tile from GMEM to SMEM, for phase phase_idx
+// matrix B: read a BK * BN tile from GMEM to SMEM, for phase phase_idx
+template<const int BM, const int BN, const int BK, const int TM, const int TN>
+__device__ void load_tiles_gmem_to_smem(float *ga, float *gb, float *sa, float *sb, int phase_idx, int N, int K) {
+    const int threads_per_block = blockDim.x * blockDim.y;
+    const int linear_thread_idx_in_block = threadIdx.y * blockDim.x + threadIdx.x;
+
+    // (row_in_A, col_in_A) is the top-left of the source A matrix
+    const int row_in_A = BM * blockIdx.y;
+    const int col_in_A = BK * phase_idx;
+    assert(BM * BK % threads_per_block == 0);
+    const int cells_per_thread_A = BM * BK / threads_per_block;
+    for (int load_phase = 0 ; load_phase < cells_per_thread_A ; ++load_phase) {
+        int linear_cell_idx_in_tile = load_phase * threads_per_block + linear_thread_idx_in_block;
+        int row_in_tile = linear_cell_idx_in_tile / BK;
+        int col_in_tile = linear_cell_idx_in_tile % BK;
+        int row_global = row_in_A + row_in_tile;
+        int col_global = col_in_A + col_in_tile;
+        sa[row_in_tile * BK + col_in_tile] = ga[row_global * K + col_global];
+    }
+
+    // (row_in_B, col_in_B) is the top-left of the source B matrix
+    const int row_in_B = BK * phase_idx;
+    const int col_in_B = BN * blockIdx.x;
+    assert(BK * BN % threads_per_block == 0);
+    const int cells_per_thread_B = BK * BN / threads_per_block;
+    for (int load_phase = 0 ; load_phase < cells_per_thread_B ; ++load_phase) {
+        int linear_cell_idx_in_tile = load_phase * threads_per_block + linear_thread_idx_in_block;
+        int row_in_tile = linear_cell_idx_in_tile / BN;
+        int col_in_tile = linear_cell_idx_in_tile % BN;
+        int row_global = row_in_B + row_in_tile;
+        int col_global = col_in_B + col_in_tile;
+        sb[row_in_tile * BN + col_in_tile] = gb[row_global * N + col_global];
+    }
+}
+
+// each thread process a tile of output cells (TM, TN)
 template<const int BM, const int BN, const int BK, const int TM, const int TN>
 __global__ void matmulKernel_blocktile_threadtile(float *a, float *b, float *c, int M, int N, int K) {
-    //assert(K % BK == 0);
-    //static_assert(BM % TM == 0 && BN % TN == 0);
-    const int linear_block_idx = blockIdx.y * gridDim.x + blockIdx.x;
-    const int linear_thread_idx = threadIdx.y * blockDim.x + threadIdx.x;
-    const int num_threads_per_block = blockDim.x * blockDim.y;
-
+    assert(K % BK == 0);
+    static_assert(BM % TM == 0 && BN % TN == 0);
+    assert(blockDim.x * blockDim.y * TM * TN == BM * BN);
     __shared__ float tile_a[BM][BK], tile_b[BK][BN];
     float reg_a[TM] = {0}, reg_b[TN] = {0}, reg_c[TM][TN] = {0};
 
     const int n_phase = K / BK;
-
     for (int phase = 0 ; phase < n_phase ; phase++) {
-        // read A tiles
-        // we have num_thread_per_block threads, to read BM * BK cells collectively.
-        // And to utilize memory coalescing, consective threads should read consecutive columns.
-        // So, each thread should read (BM * BK / blockDim.x) rows
-        assert(BM * BK % num_threads_per_block == 0);
-        int read_cells = BM * BK / num_threads_per_block;
-        for (int load_phase = 0 ; load_phase < read_cells ; ++load_phase) {
-            int linear_idx_in_tile = load_phase * num_threads_per_block + linear_thread_idx;
-            int tile_row = linear_idx_in_tile / BK;
-            int tile_col = linear_idx_in_tile % BK;
-            int A_row = BM * blockIdx.y + tile_row;
-            int A_col = phase * BK + tile_col;
-            tile_a[tile_row][tile_col] = a[A_row * K + A_col];
-        }
-        
-        // read B tiles
-        assert(BK * BN % num_threads_per_block == 0);
-        read_cells = BK * BN / num_threads_per_block;
-        for (int load_phase = 0 ; load_phase < read_cells ; ++load_phase) {
-            int linear_idx_in_tile = load_phase * num_threads_per_block + linear_thread_idx;
-            int tile_row = linear_idx_in_tile / BN;
-            int tile_col = linear_idx_in_tile % BN;
-            int B_row = phase * BK + tile_row;
-            int B_col = BN * blockIdx.x + tile_col;
-            tile_b[tile_row][tile_col] = b[B_row * N + B_col];
-        }
+        load_tiles_gmem_to_smem<BM, BN, BK, TM, TN>(a, b, (float*)tile_a, (float*)tile_b, phase, N, K);
         __syncthreads();
 
         for (int k = 0 ; k < BK ; ++k) {
@@ -124,7 +131,6 @@ __global__ void matmulKernel_blocktile_threadtile(float *a, float *b, float *c, 
                 for (int j = 0 ; j < TN ; ++j)
                     reg_c[i][j] += reg_a[i] * reg_b[j];
         }
-
         __syncthreads();
     }
     // write out
@@ -136,9 +142,77 @@ __global__ void matmulKernel_blocktile_threadtile(float *a, float *b, float *c, 
         }
 }
 
+// each warp process (WM * WN) output cells, while each thread process (TM * TN) cells.
+// since one warp contains 32 threads, there should be (WM * WN) / (TM * TN) == 32. 
 template<const int BM, const int BN, const int BK, const int WM, const int WN, const int TM, const int TN>
 __global__ void matmulKernel_blocktile_threadtile_warptile(float *a, float *b, float *c, int M, int N, int K) {
+    static_assert(BM % WM == 0 && BN % WN == 0);
+    static_assert(WM % TM == 0 && WN % TN == 0);
+    assert(blockDim.x * blockDim.y * TM * TN == BM * BN);
+    static_assert((WM/TM) * (WN/TN) == 32); // one warp-tile is handled by one warp (i.e. 32 threads) exactly
+    assert(K % BK == 0);
 
+    __shared__ float tile_a[BM][BK+1], tile_b[BK][BN+1];
+    float reg_a[TM] = {0}, reg_b[TN] = {0}, reg_c[TM][TN] = {0};
+
+    const int linear_thread_id_in_block_tile = threadIdx.y * blockDim.x + threadIdx.x;
+    //assert(linear_thread_id_in_block_tile < blockDim.x * blockDim.y);
+    const int warp_id_in_block_tile = linear_thread_id_in_block_tile / 32;
+
+    constexpr int NUM_WARPTILE_ROWS_IN_BLOCK = BM / WM;
+    constexpr int NUM_WARPTILE_COLS_IN_BLOCK = BN / WN;
+    const int warp_row_idx_in_block = warp_id_in_block_tile / NUM_WARPTILE_COLS_IN_BLOCK;
+    const int warp_col_idx_in_block = warp_id_in_block_tile % NUM_WARPTILE_COLS_IN_BLOCK;
+    //assert(warp_row_idx_in_block < 2);  // TODO: remove
+    //assert(warp_col_idx_in_block < 4);  // TODO: remove
+
+    const int lane_id = linear_thread_id_in_block_tile % 32;
+    constexpr int NUM_THREADTILE_ROWS_IN_WARPTILE = WM / TM;
+    constexpr int NUM_THREADTILE_COLS_IN_WARPTILE = WN / TN;
+
+    const int threadtile_row_idx_in_warptile = lane_id / NUM_THREADTILE_COLS_IN_WARPTILE;
+    const int threadtile_col_idx_in_warptile = lane_id % NUM_THREADTILE_COLS_IN_WARPTILE;
+    //assert(threadtile_row_idx_in_warptile < 8);
+    //assert(threadtile_col_idx_in_warptile < 4);
+
+    const int threadtile_row_idx_in_block = warp_row_idx_in_block * NUM_THREADTILE_ROWS_IN_WARPTILE + threadtile_row_idx_in_warptile;
+    const int threadtile_col_idx_in_block = warp_col_idx_in_block * NUM_THREADTILE_COLS_IN_WARPTILE + threadtile_col_idx_in_warptile;
+    //assert(threadtile_row_idx_in_block < 16);
+    //assert(threadtile_col_idx_in_block < 16);
+
+    const int block_row = BM * blockIdx.y;
+    const int block_col = BN * blockIdx.x;
+    const int warptile_row = block_row + warp_row_idx_in_block * WM;
+    const int warptile_col = block_col + warp_col_idx_in_block * WN;
+    const int threadtile_row = warptile_row + threadtile_row_idx_in_warptile * TM;
+    const int threadtile_col = warptile_col + threadtile_col_idx_in_warptile * TN;
+
+    const int n_phase = K / BK;
+    for (int phase_idx = 0 ; phase_idx < n_phase ; ++phase_idx) {
+        load_tiles_gmem_to_smem<BM, BN, BK, TM, TN>(a, b, (float*)tile_a, (float*)tile_b, phase_idx, N, K);
+        __syncthreads();
+        for (int k = 0 ; k < BK ; ++k) {
+            for (int i = 0 ; i < TM ; ++i) {
+                //assert(threadtile_row_idx_in_block * TM + i < BM);
+                reg_a[i] = tile_a[threadtile_row_idx_in_block * TM + i][k];
+            }
+            for (int j = 0 ; j < TN ; ++j) {
+                //assert(threadtile_col_idx_in_block * TN + j < BN);
+                reg_b[j] = tile_b[k][threadtile_col_idx_in_block * TN + j];
+            }
+            for (int i = 0 ; i < TM ; ++i)
+                for (int j = 0 ; j < TN ; ++j)
+                    reg_c[i][j] += reg_a[i] * reg_b[j];
+        }
+        __syncthreads();
+    }
+    // write out
+    for (int i = 0 ; i < TM ; ++i)
+        for (int j = 0 ; j < TN ; ++j) {
+            int row = threadtile_row + i;
+            int col = threadtile_col + j;  
+            c[row * N + col] = reg_c[i][j];
+        }    
 }
 
 bool verify(float *h_golden, float *d_test, int M, int N) {
@@ -162,12 +236,14 @@ void runBenchmark(int M, int N, int K, size_t kernel_id, float *h_A, float *h_B,
         matmulKernel_coal_v2<32,32>,
         matmulKernel_blocktile<32>,
         matmulKernel_blocktile_threadtile<128,128,16,8,8>,
+        matmulKernel_blocktile_threadtile_warptile<128,128,16,32,32,8,4>,
     };
     auto grid_dims = std::vector{
         dim3(cdiv(M, 32), cdiv(N, 32)), 
         dim3(cdiv(M, 32), cdiv(N, 32)),
         dim3(cdiv(M, 32), cdiv(N, 32)),
         dim3(cdiv(M, 32), cdiv(N, 32)),
+        dim3(cdiv(M, 128), cdiv(N, 128)),
         dim3(cdiv(M, 128), cdiv(N, 128)),
     };
     auto block_dims = std::vector{
@@ -176,9 +252,11 @@ void runBenchmark(int M, int N, int K, size_t kernel_id, float *h_A, float *h_B,
         dim3(32*32),
         dim3(32, 32),
         dim3(16, 16),
+        dim3(16, 32),
     };
     auto kernel_names = std::vector{
-        "matmulKernel", "matmulKernel_coal", "matmulKernel_coal_v2", "matmulKernel_blocktile", "matmulKernel_blocktile_threadtile"
+        "matmulKernel", "matmulKernel_coal", "matmulKernel_coal_v2", "matmulKernel_blocktile",
+        "matmulKernel_blocktile_threadtile", "matmulKernel_blocktile_threadtile_warptile"
     };
 
     float *d_A, *d_B, *d_C;
@@ -258,55 +336,14 @@ void run(int M, int N, int K) {
         printf("\n");
     }
 
-    runBenchmark(M, N, K, 0, h_A, h_B, h_C);
-    runBenchmark(M, N, K, 1, h_A, h_B, h_C);
-    runBenchmark(M, N, K, 2, h_A, h_B, h_C);
-    runBenchmark(M, N, K, 3, h_A, h_B, h_C);
-    runBenchmark(M, N, K, 4, h_A, h_B, h_C);
-    runBenchmark(M, N, K, 100, h_A, h_B, h_C);
+    //runBenchmark(M, N, K, 0, h_A, h_B, h_C);
+    //runBenchmark(M, N, K, 1, h_A, h_B, h_C);
+    //runBenchmark(M, N, K, 2, h_A, h_B, h_C);
+    //runBenchmark(M, N, K, 3, h_A, h_B, h_C);
+    //runBenchmark(M, N, K, 4, h_A, h_B, h_C);
+    runBenchmark(M, N, K, 5, h_A, h_B, h_C);
+    //runBenchmark(M, N, K, 100, h_A, h_B, h_C);
 
-    /*
-    {
-        float *d_C;
-        cudaMalloc((void**)&d_C, M*N*sizeof(float));
-        auto start = std::chrono::high_resolution_clock::now();
-        matmulKernel<<<dim3((M+BLOCKSIZE-1)/BLOCKSIZE, (N+BLOCKSIZE-1)/BLOCKSIZE), dim3(BLOCKSIZE, BLOCKSIZE)>>>(d_A, d_B, d_C, M, N, K);
-        cudaDeviceSynchronize();
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        std::cout << "NaiveKernel Time taken: " << duration.count() << " microseconds" << std::endl;
-        assert(verify(h_C, d_C, M, N));
-        cudaFree(d_C);
-    }
-    
-    {
-        float *d_C;
-        cudaMalloc((void**)&d_C, M*N*sizeof(float));
-        auto start = std::chrono::high_resolution_clock::now();
-        matmulKernel_coal<<<dim3((M+BLOCKSIZE-1)/BLOCKSIZE, (N+BLOCKSIZE-1)/BLOCKSIZE), dim3(BLOCKSIZE, BLOCKSIZE)>>>(d_A, d_B, d_C, M, N, K);
-        cudaDeviceSynchronize();
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        std::cout << "NaiveKernel+Coalescing Time taken: " << duration.count() << " microseconds" << std::endl;
-        assert(verify(h_C, d_C, M, N));
-        cudaFree(d_C);
-    }
-    
-    {
-        float *d_C;
-        cudaMalloc((void**)&d_C, M*N*sizeof(float));
-        auto start = std::chrono::high_resolution_clock::now();
-        matmulKernel_blocktile<<<dim3((M+BLOCKSIZE-1)/BLOCKSIZE, (N+BLOCKSIZE-1)/BLOCKSIZE), dim3(BLOCKSIZE, BLOCKSIZE)>>>(d_A, d_B, d_C, M, N, K);
-        cudaDeviceSynchronize();
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        std::cout << "Tiled Kernel Time taken: " << duration.count() << " microseconds" << std::endl;
-        assert(verify(h_C, d_C, M, N));
-        cudaFree(d_C);
-    }
-    cudaFree(d_B);
-    cudaFree(d_A);
-    */
     free(h_C);
     free(h_B);
     free(h_A);
