@@ -15,22 +15,22 @@ __global__ void matmulKernel_blocktile_threadtile_warptile_vectorize(float *a, f
     constexpr int WITERN = WN / WSUBN;
     static_assert((WSUBM * WSUBN) / (TM * TN) == 32);
 
-    const int thread_linear_idx = threadIdx.y * blockDim.x + threadIdx.x;
-    const int warp_id = thread_linear_idx / 32;
+    const int warp_id = threadIdx.x / 32;
     constexpr int NUM_WARPTILE_COLS = BN / WN;
     const int warp_row_idx = warp_id / NUM_WARPTILE_COLS;
     const int warp_col_idx = warp_id % NUM_WARPTILE_COLS;
 
-    const int lane_id = thread_linear_idx % 32;
+    const int lane_id = threadIdx.x % 32;
     const int thread_row_in_warp = lane_id / (WSUBN / TN);
     const int thread_col_in_warp = lane_id % (WSUBN / TN);
 
-    __shared__ float sa[BK*BM], sb[BK*BN];
+    __shared__ float sa[BK*(BM+4)], sb[BK*(BN+4)];
     float reg_a[WITERM*TM], reg_b[WITERN*TN], reg_c[WITERM * TM * WITERN * TN] = {0};
 
     const int n_phase = K / BK;
+    #pragma unroll
     for (int phase_idx = 0 ; phase_idx < n_phase ; ++phase_idx) {
-        load_tiles_gmem_to_smem_vectorize<BM, BN, BK>(a, b, (float*)sa, BK, (float*)sb, BN, phase_idx, N, K);
+        load_tiles_gmem_to_smem_vectorize<BM, BN, BK>(a, b, (float*)sa, (float*)sb, phase_idx, N, K);
         // note that sa is transposed
         __syncthreads();
 
@@ -38,14 +38,14 @@ __global__ void matmulKernel_blocktile_threadtile_warptile_vectorize(float *a, f
             for (int sub_row_idx = 0 ; sub_row_idx < WITERM ; ++sub_row_idx) {
                 for (int thread_row_idx = 0 ; thread_row_idx < TM ; ++thread_row_idx) {
                     int row_in_sa = warp_row_idx * WM + sub_row_idx * WSUBM + thread_row_in_warp * TM + thread_row_idx;
-                    reg_a[sub_row_idx * TM + thread_row_idx] = sa[k * BM + row_in_sa];  // note that sa is transposed
+                    reg_a[sub_row_idx * TM + thread_row_idx] = sa[k * (BM+4) + row_in_sa];  // note that sa is transposed
                 }
             }
 
             for (int sub_col_idx = 0 ; sub_col_idx < WITERN ; ++sub_col_idx) {
                 for (int thread_col_idx = 0 ; thread_col_idx < TN ; ++thread_col_idx) {
                     int col_in_sb = warp_col_idx * WN + sub_col_idx * WSUBN + thread_col_in_warp * TN + thread_col_idx;
-                    reg_b[sub_col_idx * TN + thread_col_idx] = sb[k * BN + col_in_sb];
+                    reg_b[sub_col_idx * TN + thread_col_idx] = sb[k * (BN+4) + col_in_sb];
                 }
             }
             
